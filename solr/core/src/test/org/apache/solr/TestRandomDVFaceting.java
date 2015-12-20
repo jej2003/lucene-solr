@@ -218,7 +218,7 @@ public class TestRandomDVFaceting extends SolrTestCaseJ4 {
       for (String method : methods) {
         if (method.equals("dv")) {
           params.set("facet.field", "{!key="+facet_field+"}"+facet_field+"_dv");
-          params.set("facet.method",(String) null);
+          params.set("facet.method","dv");
         } else {
           params.set("facet.field", facet_field);
           params.set("facet.method", method);
