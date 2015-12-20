@@ -23,12 +23,14 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.MultiPostingsEnum;
 import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.uninverting.FieldCache;
 import org.apache.lucene.search.FilterCollector;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.Query;
@@ -37,8 +39,10 @@ import org.apache.lucene.search.grouping.AbstractAllGroupHeadsCollector;
 import org.apache.lucene.search.grouping.term.TermAllGroupsCollector;
 import org.apache.lucene.search.grouping.term.TermGroupFacetCollector;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefBuilder;
 import org.apache.lucene.util.CharsRefBuilder;
 import org.apache.lucene.util.StringHelper;
+import org.apache.lucene.util.UnicodeUtil;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrException.ErrorCode;
 import org.apache.solr.common.params.CommonParams;
@@ -60,24 +64,33 @@ import org.apache.solr.schema.IndexSchema;
 import org.apache.solr.schema.SchemaField;
 import org.apache.solr.schema.TrieField;
 import org.apache.solr.search.BitDocSet;
+import org.apache.solr.search.DocIterator;
 import org.apache.solr.search.DocSet;
 import org.apache.solr.search.Filter;
 import org.apache.solr.search.Grouping;
 import org.apache.solr.search.HashDocSet;
 import org.apache.solr.search.Insanity;
 import org.apache.solr.search.QParser;
+import org.apache.solr.search.QueryContext;
 import org.apache.solr.search.QueryParsing;
 import org.apache.solr.search.SolrIndexSearcher;
 import org.apache.solr.search.SortedIntDocSet;
 import org.apache.solr.search.SyntaxError;
+import org.apache.solr.search.facet.FacetContext;
+import org.apache.solr.search.facet.FacetParser;
+import org.apache.solr.search.facet.FacetProcessor;
+import org.apache.solr.search.facet.FacetRequest;
+import org.apache.solr.search.facet.FacetTopParser;
 import org.apache.solr.search.grouping.GroupingSpecification;
 import org.apache.solr.util.BoundedTreeSet;
 import org.apache.solr.util.DefaultSolrThreadFactory;
+import org.apache.solr.util.LongPriorityQueue;
 
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -361,7 +374,7 @@ public class SimpleFacets {
   }
 
   enum FacetMethod {
-    ENUM, FC, FCS;
+    ENUM, FC, FCS, DV;
   }
 
   /**
@@ -423,6 +436,8 @@ public class SimpleFacets {
       method = FacetMethod.FCS;
     } else if (FacetParams.FACET_METHOD_fc.equals(methodStr)) {
       method = FacetMethod.FC;
+    } else if (FacetParams.FACET_METHOD_dv.equals(methodStr)) {
+      method = FacetMethod.DV;
     }
 
     if (method == FacetMethod.ENUM && TrieField.getMainValuePrefix(ft) != null) {
@@ -455,8 +470,8 @@ public class SimpleFacets {
     }
     
     if (method == FacetMethod.ENUM && sf.hasDocValues()) {
-      // only fc can handle docvalues types
-      method = FacetMethod.FC;
+      // only fc or dv can handle docvalues types
+      method = method == FacetMethod.DV ? FacetMethod.DV : FacetMethod.FC;
     }
 
     if (params.getFieldBool(field, GroupParams.GROUP_FACET, false)) {
@@ -487,6 +502,77 @@ public class SimpleFacets {
           }
           break;
         case FC:
+//          if (multiToken || TrieField.getMainValuePrefix(ft) != null) {
+
+            //Emulate the JSON Faceting structure so we can use the same parsing classes
+            Map<String, Object> jsonFacet = new HashMap<>(13);
+            jsonFacet.put("type", "terms");
+            jsonFacet.put("field", field);
+            jsonFacet.put("offset", offset);
+            jsonFacet.put("limit", limit);
+            jsonFacet.put("mincount", mincount);
+            jsonFacet.put("missing", missing);
+            jsonFacet.put("prefix", prefix);
+            jsonFacet.put("numBuckets", params.getFieldBool(field, "numBuckets", false));
+            jsonFacet.put("allBuckets", params.getFieldBool(field, "allBuckets", false));
+            jsonFacet.put("method", "uif");
+            jsonFacet.put("cacheDf", 0);
+            jsonFacet.put("perSeg", false);
+            jsonFacet.put("sort", sort);
+            //need to see if there are any exclusions that we should be applying
+            String exclusions = params.get("ex", null);
+            if(exclusions != null) {
+              Map<String, Object> domain = new HashMap<>(1);
+              domain.put("excludeTags", exclusions);
+              jsonFacet.put("domain", domain);
+            }
+            Map<String, Object> topLevel = new HashMap<>();
+            topLevel.put(field, jsonFacet);
+
+            FacetParser parser = new FacetTopParser(rb.req);
+            FacetRequest facetRequest = null;
+            try {
+              facetRequest = parser.parse(topLevel);
+            } catch (SyntaxError syntaxError) {
+              throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, syntaxError);
+            }
+
+            FacetContext fcontext = new FacetContext();
+            fcontext.base = docs;//rb.getResults().docSet;
+            fcontext.req = rb.req;
+            fcontext.searcher = searcher;
+            fcontext.qcontext = QueryContext.newContext(fcontext.searcher);
+
+            FacetProcessor fproc = facetRequest.createFacetProcessor(fcontext);
+            //TODO do we handle debug?  Should probably already be handled by the legacy code
+            fproc.process();
+
+            //Go through the response to build the expected output for SimpleFacets
+            Object res = fproc.getResponse();
+            counts = new NamedList<Integer>();
+            if(res != null) {
+              SimpleOrderedMap<Object> som = (SimpleOrderedMap<Object>)res;
+              if((Integer)som.get("count") > 0) {
+                SimpleOrderedMap<Object> asdf = (SimpleOrderedMap<Object>) som.get(field);
+
+                List<SimpleOrderedMap<Object>> buckets = (List<SimpleOrderedMap<Object>>)asdf.get("buckets");
+                for(SimpleOrderedMap<Object> b : buckets) {
+                  counts.add(b.get("val").toString(), (Integer)b.get("count"));
+                }
+                if(missing) {
+                  SimpleOrderedMap<Object> missingCounts = (SimpleOrderedMap<Object>) asdf.get("missing");
+                  counts.add(null, (Integer)missingCounts.get("count"));
+                }
+              } else if(missing) {
+                counts.add(null, 0);
+              }
+
+            }
+//          } else {
+//            counts = getFieldCacheCounts(searcher, docs, field, offset,limit, mincount, missing, sort, prefix);
+//          }
+          break;
+        case DV:
           counts = DocValuesFacets.getCounts(searcher, docs, field, offset,limit, mincount, missing, sort, prefix, contains, ignoreCase);
           break;
         default:
@@ -694,6 +780,154 @@ public class SimpleFacets {
         (sf.getType().getRangeQuery(null, sf, null, null, false, false));
     return docs.andNotSize(hasVal);
   }
+
+  /**
+   * Use the Lucene FieldCache to get counts for each unique field value in <code>docs</code>.
+   * The field must have at most one indexed token per document.
+   */
+//  public static NamedList<Integer> getFieldCacheCounts(SolrIndexSearcher searcher, DocSet docs, String fieldName, int offset, int limit, int mincount, boolean missing, String sort, String prefix) throws IOException {
+//    // TODO: If the number of terms is high compared to docs.size(), and zeros==false,
+//    //  we should use an alternate strategy to avoid
+//    //  1) creating another huge int[] for the counts
+//    //  2) looping over that huge int[] looking for the rare non-zeros.
+//    //
+//    // Yet another variation: if docs.size() is small and termvectors are stored,
+//    // then use them instead of the FieldCache.
+//    //
+//
+//    // TODO: this function is too big and could use some refactoring, but
+//    // we also need a facet cache, and refactoring of SimpleFacets instead of
+//    // trying to pass all the various params around.
+//
+//    FieldType ft = searcher.getSchema().getFieldType(fieldName);
+//    NamedList<Integer> res = new NamedList<>();
+//
+//    //FIXME Is there a better way to do this?  Looks like we need to wrap each tims since SolrIndexSearcher removed
+//    //the top level reader
+//    SortedDocValues si = FieldCache.DEFAULT.getTermsIndex(org.apache.lucene.index.SlowCompositeReaderWrapper.wrap(searcher.getIndexReader()), fieldName);
+//
+//    BytesRef br = new BytesRef();
+//
+//    final BytesRefBuilder prefixRef;
+//    if (prefix == null) {
+//      prefixRef = null;
+//    } else if (prefix.length()==0) {
+//      prefix = null;
+//      prefixRef = null;
+//    } else {
+//      prefixRef = new BytesRefBuilder();
+//      prefixRef.copyChars(prefix);
+//    }
+//
+//    int startTermIndex, endTermIndex;
+//    if (prefix!=null) {
+//      startTermIndex = si.lookupTerm(prefixRef.get());
+//      if (startTermIndex<0) startTermIndex=-startTermIndex-1;
+//      prefixRef.append(UnicodeUtil.BIG_TERM);
+//      endTermIndex = si.lookupTerm(prefixRef.get());
+//      assert endTermIndex < 0;
+//      endTermIndex = -endTermIndex-1;
+//    } else {
+//      startTermIndex=-1;
+//      endTermIndex=si.getValueCount();
+//    }
+//
+//    final int nTerms=endTermIndex-startTermIndex;
+//    int missingCount = -1;
+////    final CharsRef charsRef = new CharsRef();
+//    final CharsRefBuilder charsRef = new CharsRefBuilder();
+//    if (nTerms>0 && docs.size() >= mincount) {
+//
+//      // count collection array only needs to be as big as the number of terms we are
+//      // going to collect counts for.
+//      final int[] counts = new int[nTerms];
+//
+//      DocIterator iter = docs.iterator();
+//
+//      while (iter.hasNext()) {
+//        int term = si.getOrd(iter.nextDoc());
+//        int arrIdx = term-startTermIndex;
+//        if (arrIdx>=0 && arrIdx<nTerms) counts[arrIdx]++;
+//      }
+//
+//      if (startTermIndex == -1) {
+//        missingCount = counts[0];
+//      }
+//
+//      // IDEA: we could also maintain a count of "other"... everything that fell outside
+//      // of the top 'N'
+//
+//      int off=offset;
+//      int lim=limit>=0 ? limit : Integer.MAX_VALUE;
+//
+//      if (sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY)) {
+//        int maxsize = limit>0 ? offset+limit : Integer.MAX_VALUE-1;
+//        maxsize = Math.min(maxsize, nTerms);
+//        LongPriorityQueue queue = new LongPriorityQueue(Math.min(maxsize,1000), maxsize, Long.MIN_VALUE);
+//
+//        int min=mincount-1;  // the smallest value in the top 'N' values
+//        for (int i=(startTermIndex==-1)?1:0; i<nTerms; i++) {
+//          int c = counts[i];
+//          if (c>min) {
+//            // NOTE: we use c>min rather than c>=min as an optimization because we are going in
+//            // index order, so we already know that the keys are ordered.  This can be very
+//            // important if a lot of the counts are repeated (like zero counts would be).
+//
+//            // smaller term numbers sort higher, so subtract the term number instead
+//            long pair = (((long)c)<<32) + (Integer.MAX_VALUE - i);
+//            boolean displaced = queue.insert(pair);
+//            if (displaced) min=(int)(queue.top() >>> 32);
+//          }
+//        }
+//
+//        // if we are deep paging, we don't have to order the highest "offset" counts.
+//        int collectCount = Math.max(0, queue.size() - off);
+//        assert collectCount <= lim;
+//
+//        // the start and end indexes of our list "sorted" (starting with the highest value)
+//        int sortedIdxStart = queue.size() - (collectCount - 1);
+//        int sortedIdxEnd = queue.size() + 1;
+//        final long[] sorted = queue.sort(collectCount);
+//
+//        for (int i=sortedIdxStart; i<sortedIdxEnd; i++) {
+//          long pair = sorted[i];
+//          int c = (int)(pair >>> 32);
+//          int tnum = Integer.MAX_VALUE - (int)pair;
+//          br = si.lookupOrd(startTermIndex+tnum);
+//          ft.indexedToReadable(br, charsRef);
+//          res.add(charsRef.toString(), c);
+//        }
+//
+//      } else {
+//        // add results in index order
+//        int i=(startTermIndex==-1)?1:0;
+//        if (mincount<=0) {
+//          // if mincount<=0, then we won't discard any terms and we know exactly
+//          // where to start.
+//          i+=off;
+//          off=0;
+//        }
+//
+//        for (; i<nTerms; i++) {
+//          int c = counts[i];
+//          if (c<mincount || --off>=0) continue;
+//          if (--lim<0) break;
+//          br = si.lookupOrd(startTermIndex+i);
+//          ft.indexedToReadable(br, charsRef);
+//          res.add(charsRef.toString(), c);
+//        }
+//      }
+//    }
+//
+//    if (missing) {
+//      if (missingCount < 0) {
+//        missingCount = getFieldMissingCount(searcher,docs,fieldName);
+//      }
+//      res.add(null, missingCount);
+//    }
+//
+//    return res;
+//  }
 
   /**
    * Returns a list of terms in the specified field along with the 
@@ -960,4 +1194,3 @@ public class SimpleFacets {
     return rb;
   }
 }
-

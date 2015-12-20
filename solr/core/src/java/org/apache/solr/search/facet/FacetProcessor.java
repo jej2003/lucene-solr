@@ -31,6 +31,7 @@ import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.grouping.AbstractAllGroupHeadsCollector;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.util.SimpleOrderedMap;
 import org.apache.solr.handler.component.ResponseBuilder;
@@ -39,6 +40,7 @@ import org.apache.solr.schema.SchemaField;
 import org.apache.solr.search.BitDocSet;
 import org.apache.solr.search.DocIterator;
 import org.apache.solr.search.DocSet;
+import org.apache.solr.search.Grouping;
 import org.apache.solr.search.QParser;
 import org.apache.solr.search.SolrIndexSearcher;
 import org.apache.solr.search.SyntaxError;
@@ -66,6 +68,36 @@ public class FacetProcessor<FacetRequestT extends FacetRequest>  {
     if (freq.domain == null) return;
     handleFilterExclusions();
     handleBlockJoin();
+    handleGrouping();
+  }
+
+  protected void handleGrouping() throws IOException {
+    // TODO: somehow remove responsebuilder dependency
+    ResponseBuilder rb = SolrRequestInfo.getRequestInfo().getResponseBuilder();
+
+    DocSet base = fcontext.base;
+    if (rb.grouping() && rb.getGroupingSpec().isTruncateGroups()) {
+      Grouping grouping = new Grouping(fcontext.searcher, null, rb.getQueryCommand(), false, 0, false);
+      grouping.setWithinGroupSort(rb.getGroupingSpec().getSortWithinGroup());
+      if (rb.getGroupingSpec().getFields().length > 0) {
+        try {
+          grouping.addFieldCommand(rb.getGroupingSpec().getFields()[0], rb.req);
+        } catch (SyntaxError syntaxError) {
+          throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, syntaxError);
+        }
+      } else if (rb.getGroupingSpec().getFunctions().length > 0) {
+        try {
+          grouping.addFunctionCommand(rb.getGroupingSpec().getFunctions()[0], rb.req);
+        } catch (SyntaxError syntaxError) {
+          throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, syntaxError);
+        }
+      } else {
+        return;
+      }
+      AbstractAllGroupHeadsCollector allGroupHeadsCollector = grouping.getCommands().get(0).createAllGroupCollector();
+      fcontext.searcher.search(base.getTopFilter(), allGroupHeadsCollector);
+      fcontext.base = new BitDocSet(allGroupHeadsCollector.retrieveGroupHeads(fcontext.searcher.maxDoc()));
+    }
   }
 
   private void handleBlockJoin() throws IOException {
